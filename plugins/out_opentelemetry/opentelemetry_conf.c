@@ -247,7 +247,6 @@ struct opentelemetry_context *flb_opentelemetry_context_create(struct flb_output
     char *host = NULL;
     char *port = NULL;
     char *metrics_uri = NULL;
-    char *traces_uri = NULL;
     char *logs_uri = NULL;
     struct flb_upstream *upstream;
     struct opentelemetry_context *ctx = NULL;
@@ -702,6 +701,18 @@ void flb_opentelemetry_context_destroy(struct opentelemetry_context *ctx)
 
     if (ctx->ra_log_meta_otlp_trace_flags) {
         flb_ra_destroy(ctx->ra_log_meta_otlp_trace_flags);
+    }
+
+    if (ctx->token_file) {
+        flb_free(ctx->token_file);
+    }
+
+    if (ctx->token) {
+        flb_free(ctx->token);
+    }
+
+    if (ctx->auth) {
+        flb_freectx->auth);
     }
 
     flb_free(ctx->proxy_host);

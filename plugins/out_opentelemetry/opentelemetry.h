@@ -25,6 +25,9 @@
 #include <fluent-bit/flb_ra_key.h>
 #include <fluent-bit/flb_http_client.h>
 
+#define FLB_OPENTELEMETRY_KUBE_TOKEN          "/var/run/secrets/kubernetes.io/serviceaccount/token"
+
+
 #define FLB_OPENTELEMETRY_CONTENT_TYPE_HEADER_NAME "Content-Type"
 #define FLB_OPENTELEMETRY_MIME_PROTOBUF_LITERAL    "application/x-protobuf"
 
@@ -50,6 +53,15 @@ struct opentelemetry_context {
     /* HTTP Auth */
     char *http_user;
     char *http_passwd;
+
+    /* HTTP OAuth */
+    char *token_file;
+    char *token;
+    int token_ttl;
+    size_t token_len;
+    time_t token_read;
+    char *auth;
+    size_t auth_len;
 
     /* Proxy */
     const char *proxy;
@@ -178,8 +190,8 @@ struct opentelemetry_context {
 };
 
 int opentelemetry_post(struct opentelemetry_context *ctx,
-                       const void *body, size_t body_len,
-                       const char *tag, int tag_len,
-                       const char *http_uri,
-                       const char *grpc_uri);
+                        const void *body, size_t body_len,
+                        const char *tag, int tag_len,
+                        const char *http_uri,
+                        const char *grpc_uri);
 #endif
