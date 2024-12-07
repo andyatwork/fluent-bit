@@ -237,6 +237,7 @@ int opentelemetry_post(struct opentelemetry_context *ctx,
     const char               *compression_algorithm;
     uint32_t                  wire_message_length;
     size_t                    grpc_body_length;
+    cfl_sds_t                 sds_result;
     cfl_sds_t                 grpc_body;
     struct flb_http_response *response;
     struct flb_http_request  *request;
@@ -267,23 +268,46 @@ int opentelemetry_post(struct opentelemetry_context *ctx,
         return FLB_RETRY;
     }
 
-    if (request->protocol_version == HTTP_PROTOCOL_VERSION_20) {
+    if (request->protocol_version == HTTP_PROTOCOL_VERSION_20 &&
+        ctx->enable_grpc_flag) {
         grpc_body = cfl_sds_create_size(body_len + 5);
 
         if (grpc_body == NULL) {
+            flb_http_client_request_destroy(request, FLB_TRUE);
+
             return FLB_RETRY;
         }
 
         wire_message_length = (uint32_t) body_len;
 
-        cfl_sds_cat(grpc_body, "\x00----", 5);
+        sds_result = cfl_sds_cat(grpc_body, "\x00----", 5);
+
+        if (sds_result == NULL) {
+            flb_http_client_request_destroy(request, FLB_TRUE);
+
+            cfl_sds_destroy(grpc_body);
+
+            return FLB_RETRY;
+        }
+
+        grpc_body = sds_result;
 
         ((uint8_t *) grpc_body)[1] = (wire_message_length & 0xFF000000) >> 24;
         ((uint8_t *) grpc_body)[2] = (wire_message_length & 0x00FF0000) >> 16;
         ((uint8_t *) grpc_body)[3] = (wire_message_length & 0x0000FF00) >> 8;
         ((uint8_t *) grpc_body)[4] = (wire_message_length & 0x000000FF) >> 0;
 
-        cfl_sds_cat(grpc_body, body, body_len);
+        sds_result = cfl_sds_cat(grpc_body, body, body_len);
+
+        if (sds_result == NULL) {
+            flb_http_client_request_destroy(request, FLB_TRUE);
+
+            cfl_sds_destroy(grpc_body);
+
+            return FLB_RETRY;
+        }
+
+        grpc_body = sds_result;
 
         grpc_body_length = cfl_sds_len(grpc_body);
 
@@ -363,17 +387,24 @@ int opentelemetry_post(struct opentelemetry_context *ctx,
      * - 205: Reset content
      *
      */
+
     if (response->status < 200 || response->status > 205) {
         if (ctx->log_response_payload &&
             response->body != NULL &&
             cfl_sds_len(response->body) > 0) {
-            flb_plg_error(ctx->ins, "%s:%i, HTTP status=%i\n%s",
-                            ctx->host, ctx->port,
-                            response->status, response->body);
+            flb_plg_error(ctx->ins,
+                          "%s:%i, HTTP status=%i\n%s",
+                          ctx->host,
+                          ctx->port,
+                          response->status,
+                          response->body);
         }
         else {
-            flb_plg_error(ctx->ins, "%s:%i, HTTP status=%i",
-                            ctx->host, ctx->port, response->status);
+            flb_plg_error(ctx->ins,
+                          "%s:%i, HTTP status=%i",
+                          ctx->host,
+                          ctx->port,
+                          response->status);
         }
 
         out_ret = FLB_RETRY;
@@ -687,6 +718,11 @@ static struct flb_config_map config_map[] = {
      "Enable, disable or force HTTP/2 usage. Accepted values : on, off, force"
     },
     {
+     FLB_CONFIG_MAP_BOOL, "grpc", "off",
+     0, FLB_TRUE, offsetof(struct opentelemetry_context, enable_grpc_flag),
+     "Enable, disable or force gRPC usage. Accepted values : on, off, auto"
+    },
+    {
      FLB_CONFIG_MAP_STR, "proxy", NULL,
      0, FLB_FALSE, 0,
      "Specify an HTTP Proxy. The expected format of this value is http://host:port. "
@@ -770,7 +806,7 @@ static struct flb_config_map config_map[] = {
     {
      FLB_CONFIG_MAP_BOOL, "log_response_payload", "true",
      0, FLB_TRUE, offsetof(struct opentelemetry_context, log_response_payload),
-     "Specify if the response paylod should be logged or not"
+     "Specify if the response payload should be logged or not"
     },
     {
      FLB_CONFIG_MAP_STR, "logs_metadata_key", "otlp",

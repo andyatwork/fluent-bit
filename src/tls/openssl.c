@@ -17,7 +17,11 @@
  *  limitations under the License.
  */
 
+#include <stdio.h>
+#include <stdlib.h>
+
 #include <fluent-bit/flb_info.h>
+#include <fluent-bit/flb_str.h>
 #include <fluent-bit/flb_compat.h>
 #include <fluent-bit/tls/flb_tls.h>
 #include <fluent-bit/tls/flb_tls_info.h>
@@ -76,6 +80,7 @@ static int tls_init(void)
     SSL_load_error_strings();
     SSL_library_init();
 #endif
+
     return 0;
 }
 
@@ -134,13 +139,66 @@ static void tls_context_destroy(void *ctx_backend)
     struct tls_context *ctx = ctx_backend;
 
     pthread_mutex_lock(&ctx->mutex);
+
     SSL_CTX_free(ctx->ctx);
+
     if (ctx->alpn != NULL) {
         flb_free(ctx->alpn);
+
+        ctx->alpn = NULL;
     }
+
     pthread_mutex_unlock(&ctx->mutex);
 
     flb_free(ctx);
+}
+
+static int tls_context_server_alpn_select_callback(SSL *ssl,
+                                                   const unsigned char **out,
+                                                   unsigned char *outlen,
+                                                   const unsigned char *in,
+                                                   unsigned int inlen,
+                                                   void *arg)
+{
+    int                 result;
+    struct tls_context *ctx;
+
+    ctx = (struct tls_context *) arg;
+
+    result = SSL_TLSEXT_ERR_NOACK;
+
+    if (ctx->alpn != NULL) {
+        result = SSL_select_next_proto((unsigned char **) out,
+                                       outlen,
+                                       (const unsigned char *) &ctx->alpn[1],
+                                       (unsigned int) ctx->alpn[0],
+                                       in,
+                                       inlen);
+
+        if (result == OPENSSL_NPN_NEGOTIATED) {
+            result = SSL_TLSEXT_ERR_OK;
+        }
+        else if (result == OPENSSL_NPN_NO_OVERLAP) {
+            result = SSL_TLSEXT_ERR_ALERT_FATAL;
+        }
+    }
+
+    return result;
+}
+
+static int tls_context_client_alpn_select_callback(SSL *ssl,
+                                                   unsigned char **out,
+                                                   unsigned char *outlen,
+                                                   const unsigned char *in,
+                                                   unsigned int inlen,
+                                                   void *arg)
+{
+    return tls_context_server_alpn_select_callback(ssl,
+                                                   (const unsigned char **) out,
+                                                   outlen,
+                                                   in,
+                                                   inlen,
+                                                   arg);
 }
 
 int tls_context_alpn_set(void *ctx_backend, const char *alpn)
@@ -205,56 +263,22 @@ int tls_context_alpn_set(void *ctx_backend, const char *alpn)
     if (result != 0) {
         result = -1;
     }
-
-    return result;
-}
-
-static int tls_context_server_alpn_select_callback(SSL *ssl,
-                                                   const unsigned char **out,
-                                                   unsigned char *outlen,
-                                                   const unsigned char *in,
-                                                   unsigned int inlen,
-                                                   void *arg)
-{
-    int                 result;
-    struct tls_context *ctx;
-
-    ctx = (struct tls_context *) arg;
-
-    result = SSL_TLSEXT_ERR_NOACK;
-
-    if (ctx->alpn != NULL) {
-        result = SSL_select_next_proto((unsigned char **) out,
-                                       outlen,
-                                       (const unsigned char *) &ctx->alpn[1],
-                                       (unsigned int) ctx->alpn[0],
-                                       in,
-                                       inlen);
-
-        if (result == OPENSSL_NPN_NEGOTIATED) {
-            result = SSL_TLSEXT_ERR_OK;
+    else {
+        if (ctx->mode == FLB_TLS_SERVER_MODE) {
+            SSL_CTX_set_alpn_select_cb(
+                ctx->ctx,
+                tls_context_server_alpn_select_callback,
+                ctx);
         }
-        else if (result == OPENSSL_NPN_NO_OVERLAP) {
-            result = SSL_TLSEXT_ERR_ALERT_FATAL;
+        else {
+            SSL_CTX_set_next_proto_select_cb(
+                ctx->ctx,
+                tls_context_client_alpn_select_callback,
+                ctx);
         }
     }
 
     return result;
-}
-
-static int tls_context_client_alpn_select_callback(SSL *ssl,
-                                                   unsigned char **out,
-                                                   unsigned char *outlen,
-                                                   const unsigned char *in,
-                                                   unsigned int inlen,
-                                                   void *arg)
-{
-    return tls_context_server_alpn_select_callback(ssl,
-                                                   (const unsigned char **) out,
-                                                   outlen,
-                                                   in,
-                                                   inlen,
-                                                   arg);
 }
 
 #ifdef _MSC_VER
@@ -424,7 +448,7 @@ static int macos_load_system_certificates(struct tls_context *ctx)
     }
 
     CFRelease(certs);
-    flb_debug("[tls] finished loading keychain certificates, total loaded: %d", loaded_cert_count);
+    flb_debug("[tls] finished loading keychain certificates, total loaded: %lu", loaded_cert_count);
     return 0;
 }
 #endif
@@ -433,6 +457,9 @@ static int load_system_certificates(struct tls_context *ctx)
 {
     int ret;
     const char *ca_file = FLB_DEFAULT_SEARCH_CA_BUNDLE;
+
+    (void) ret;
+    (void) ca_file;
 
     /* For Windows use specific API to read the certs store */
 #ifdef _MSC_VER
@@ -453,6 +480,33 @@ static int load_system_certificates(struct tls_context *ctx)
 #endif
 }
 
+#ifdef FLB_HAVE_DEV
+/* This is not thread safe */
+static void ssl_key_logger(const SSL *ssl, const char *line)
+{
+    char *key_log_filename;
+    FILE *key_log_file;
+
+    key_log_filename = getenv("SSLKEYLOGFILE");
+
+    if (key_log_filename == NULL) {
+        return;
+    }
+
+    key_log_file = fopen(key_log_filename, "a");
+
+    if (key_log_file == NULL) {
+        return;
+    }
+
+    setvbuf(key_log_file, NULL, 0, _IOLBF);
+
+    fprintf(key_log_file, "%s\n", line);
+
+    fclose(key_log_file);
+}
+#endif
+
 static void *tls_context_create(int verify,
                                 int debug,
                                 int mode,
@@ -467,6 +521,7 @@ static void *tls_context_create(int verify,
     SSL_CTX *ssl_ctx;
     struct tls_context *ctx;
     char err_buf[256];
+    char *key_log_filename;
 
     /*
      * Init library ? based in the documentation on OpenSSL >= 1.1.0 is not longer
@@ -509,24 +564,21 @@ static void *tls_context_create(int verify,
         flb_errno();
         return NULL;
     }
+
+#ifdef FLB_HAVE_DEV
+    key_log_filename = getenv("SSLKEYLOGFILE");
+
+    if (key_log_filename != NULL) {
+        SSL_CTX_set_keylog_callback(ssl_ctx, ssl_key_logger);
+    }
+#endif
+
+
     ctx->ctx = ssl_ctx;
     ctx->mode = mode;
     ctx->alpn = NULL;
     ctx->debug_level = debug;
     pthread_mutex_init(&ctx->mutex, NULL);
-
-    if (mode == FLB_TLS_SERVER_MODE) {
-        SSL_CTX_set_alpn_select_cb(
-            ssl_ctx,
-            tls_context_server_alpn_select_callback,
-            ctx);
-    }
-    else {
-        SSL_CTX_set_next_proto_select_cb(
-            ssl_ctx,
-            tls_context_client_alpn_select_callback,
-            ctx);
-    }
 
     /* Verify peer: by default OpenSSL always verify peer */
     if (verify == FLB_FALSE) {
