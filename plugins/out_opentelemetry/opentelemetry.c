@@ -17,6 +17,9 @@
  *  limitations under the License.
  */
 
+#include <sys/types.h>
+#include <sys/stat.h>
+
 #include <fluent-bit/flb_output_plugin.h>
 #include <fluent-bit/flb_input_event.h>
 #include <fluent-bit/flb_snappy.h>
@@ -43,6 +46,132 @@ extern void cmt_encode_opentelemetry_destroy(cfl_sds_t text);
 #include "opentelemetry.h"
 #include "opentelemetry_conf.h"
 #include "opentelemetry_utils.h"
+
+static int file_to_buffer(const char *path,
+                          char **out_buf, size_t *out_size)
+{
+    int ret;
+    int len;
+    char *buf;
+    ssize_t bytes;
+    FILE *fp;
+    struct stat st;
+
+    if (!(fp = fopen(path, "r"))) {
+        return -1;
+    }
+
+    ret = stat(path, &st);
+    if (ret == -1) {
+        flb_errno();
+        fclose(fp);
+        return -1;
+    }
+
+    buf = flb_calloc(1, (st.st_size + 1));
+    if (!buf) {
+        flb_errno();
+        fclose(fp);
+        return -1;
+    }
+
+    bytes = fread(buf, st.st_size, 1, fp);
+    if (bytes < 1) {
+        flb_free(buf);
+        fclose(fp);
+        return -1;
+    }
+
+    fclose(fp);
+
+    /* trim new lines */
+    for (len = st.st_size; len > 0; len--) {
+        if (buf[len-1] != '\n' && buf[len-1] != '\r') {
+            break;
+        }
+    }
+    buf[len] = '\0';
+
+    *out_buf = buf;
+    *out_size = len;
+
+    return 0;
+}
+
+/* Set Authorization Token and get HTTP Auth Header */
+static int set_http_auth_header(struct opentelemetry_context *ctx)
+{
+    int ret;
+    char *temp;
+    char *tk = NULL;
+    size_t tk_size = 0;
+
+    if (!ctx->token_file || strlen(ctx->token_file) == 0) {
+        return 0;
+    }
+
+    ret = file_to_buffer(ctx->token_file, &tk, &tk_size);
+    if (ret == -1) {
+        flb_plg_warn(ctx->ins, "cannot open %s", ctx->token_file);
+        return -1;
+    }
+    ctx->token_read = time(NULL);
+
+    /* Token */
+    if (ctx->token != NULL) {
+        flb_free(ctx->token);
+    }
+    ctx->token = tk;
+    ctx->token_len = tk_size;
+
+    /* HTTP Auth Header */
+    if (ctx->auth == NULL) {
+        ctx->auth = flb_malloc(tk_size + 32);
+    }
+    else if (ctx->auth_len < tk_size + 32) {
+        temp = flb_realloc(ctx->auth, tk_size + 32);
+        if (temp == NULL) {
+            flb_errno();
+            flb_free(ctx->auth);
+            ctx->auth = NULL;
+            return -1;
+        }
+        ctx->auth = temp;
+    }
+
+    if (!ctx->auth) {
+        return -1;
+    }
+
+    ctx->auth_len = snprintf(ctx->auth, tk_size + 32, "Bearer %s", tk);
+    return 0;
+}
+
+/* Refresh HTTP Auth Header if K8s Authorization Token is expired */
+static int refresh_token_if_needed(struct opentelemetry_context *ctx)
+{
+    int expired = FLB_FALSE;
+    int ret;
+
+    if (!ctx->token_file || strlen(ctx->token_file) == 0) {
+        return 0;
+    }
+
+    if (ctx->token_read > 0) {
+        if (time(NULL) > ctx->token_read + ctx->token_ttl) {
+            expired = FLB_TRUE;
+        }
+    }
+
+    if (expired || ctx->token_read == 0) {
+        ret = set_http_auth_header(ctx);
+        if (ret == -1) {
+            return -1;
+        }
+    }
+
+    return 0;
+}
 
 int opentelemetry_legacy_post(struct opentelemetry_context *ctx,
                               const void *body, size_t body_len,
@@ -72,6 +201,12 @@ int opentelemetry_legacy_post(struct opentelemetry_context *ctx,
                       ctx->u->tcp_host,
                       ctx->u->tcp_port);
 
+        return FLB_RETRY;
+    }
+
+    ret = refresh_token_if_needed(ctx);
+    if (ret == -1) {
+        flb_plg_error(ctx->ins, "failed to refresh token");
         return FLB_RETRY;
     }
 
@@ -133,6 +268,10 @@ int opentelemetry_legacy_post(struct opentelemetry_context *ctx,
     if (ctx->http_user != NULL &&
         ctx->http_passwd != NULL) {
         flb_http_basic_auth(c, ctx->http_user, ctx->http_passwd);
+    }
+
+    if (ctx->auth_len > 0) {
+        flb_http_add_header(c, "Authorization", 13, ctx->auth, ctx->auth_len);
     }
 
     flb_http_add_header(c, "User-Agent", 10, "Fluent-Bit", 10);
@@ -872,7 +1011,18 @@ static struct flb_config_map config_map[] = {
      0, FLB_TRUE, offsetof(struct opentelemetry_context, logs_severity_number_message_key),
      "Specify a Severity Number key"
     },
-
+    /* Kubernetes Token file */
+    {
+     FLB_CONFIG_MAP_STR, "kube_token_file", NULL,
+     0, FLB_TRUE, offsetof(struct opentelemetry_context, token_file),
+     "Kubernetes authorization token file"
+    },
+    /* Kubernetes Token file TTL */
+    {
+     FLB_CONFIG_MAP_TIME, "kube_token_ttl", "10m",
+     0, FLB_TRUE, offsetof(struct opentelemetry_context, token_ttl),
+     "kubernetes token ttl, until it is reread from the token file. Default: 10m"
+    },
 
     /* EOF */
     {0}
