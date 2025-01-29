@@ -52,17 +52,29 @@ struct opentelemetry_context {
     char *http_user;
     char *http_passwd;
 
+    /* HTTP OAuth */
+    char *token_file;
+    char *token;
+    int token_ttl;
+    size_t token_len;
+    time_t token_read;
+    char *auth;
+    size_t auth_len;
+
     /* Proxy */
     const char *proxy;
     char *proxy_host;
     int proxy_port;
 
     /* HTTP URI */
+    char *profiles_uri_sanitized;
     char *traces_uri_sanitized;
     char *metrics_uri_sanitized;
     char *logs_uri_sanitized;
     char *traces_uri;
     char *grpc_traces_uri;
+    char *profiles_uri;
+    char *grpc_profiles_uri;
     char *metrics_uri;
     char *grpc_metrics_uri;
     char *logs_uri;
@@ -179,8 +191,8 @@ struct opentelemetry_context {
 };
 
 int opentelemetry_post(struct opentelemetry_context *ctx,
-                       const void *body, size_t body_len,
-                       const char *tag, int tag_len,
-                       const char *http_uri,
-                       const char *grpc_uri);
+                        const void *body, size_t body_len,
+                        const char *tag, int tag_len,
+                        const char *http_uri,
+                        const char *grpc_uri);
 #endif

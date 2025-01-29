@@ -247,7 +247,6 @@ struct opentelemetry_context *flb_opentelemetry_context_create(struct flb_output
     char *host = NULL;
     char *port = NULL;
     char *metrics_uri = NULL;
-    char *traces_uri = NULL;
     char *logs_uri = NULL;
     struct flb_upstream *upstream;
     struct opentelemetry_context *ctx = NULL;
@@ -332,6 +331,7 @@ struct opentelemetry_context *flb_opentelemetry_context_create(struct flb_output
     ctx->logs_uri_sanitized = sanitize_uri(ctx->logs_uri);
     ctx->traces_uri_sanitized = sanitize_uri(ctx->traces_uri);
     ctx->metrics_uri_sanitized = sanitize_uri(ctx->metrics_uri);
+    ctx->profiles_uri_sanitized = sanitize_uri(ctx->profiles_uri);
 
     if (ctx->logs_uri_sanitized == NULL) {
         flb_plg_trace(ctx->ins,
@@ -357,6 +357,16 @@ struct opentelemetry_context *flb_opentelemetry_context_create(struct flb_output
         flb_plg_trace(ctx->ins,
                       "Could not allocate memory for sanitized "
                       "metric endpoint uri");
+
+        flb_opentelemetry_context_destroy(ctx);
+
+        return NULL;
+    }
+
+    if (ctx->profiles_uri_sanitized == NULL) {
+        flb_plg_trace(ctx->ins,
+                      "Could not allocate memory for sanitized "
+                      "profiles endpoint uri");
 
         flb_opentelemetry_context_destroy(ctx);
 
@@ -604,6 +614,10 @@ void flb_opentelemetry_context_destroy(struct opentelemetry_context *ctx)
         flb_free(ctx->metrics_uri_sanitized);
     }
 
+    if (ctx->profiles_uri_sanitized != NULL && ctx->profiles_uri_sanitized != ctx->profiles_uri) {
+        flb_free(ctx->profiles_uri_sanitized);
+    }
+
     /* release log_body_key_list */
     log_body_key_list_destroy(ctx);
 
@@ -702,6 +716,18 @@ void flb_opentelemetry_context_destroy(struct opentelemetry_context *ctx)
 
     if (ctx->ra_log_meta_otlp_trace_flags) {
         flb_ra_destroy(ctx->ra_log_meta_otlp_trace_flags);
+    }
+
+    if (ctx->token_file) {
+        flb_free(ctx->token_file);
+    }
+
+    if (ctx->token) {
+        flb_free(ctx->token);
+    }
+
+    if (ctx->auth) {
+        flb_free(ctx->auth);
     }
 
     flb_free(ctx->proxy_host);

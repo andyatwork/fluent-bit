@@ -17,6 +17,9 @@
  *  limitations under the License.
  */
 
+#include <sys/types.h>
+#include <sys/stat.h>
+
 #include <fluent-bit/flb_output_plugin.h>
 #include <fluent-bit/flb_input_event.h>
 #include <fluent-bit/flb_snappy.h>
@@ -37,12 +40,142 @@
 #include <ctraces/ctraces.h>
 #include <ctraces/ctr_decode_msgpack.h>
 
+#include <cprofiles/cprofiles.h>
+#include <cprofiles/cprof_decode_msgpack.h>
+#include <cprofiles/cprof_encode_opentelemetry.h>
+
 extern cfl_sds_t cmt_encode_opentelemetry_create(struct cmt *cmt);
 extern void cmt_encode_opentelemetry_destroy(cfl_sds_t text);
 
 #include "opentelemetry.h"
 #include "opentelemetry_conf.h"
 #include "opentelemetry_utils.h"
+
+static int file_to_buffer(const char *path,
+                          char **out_buf, size_t *out_size)
+{
+    int ret;
+    int len;
+    char *buf;
+    ssize_t bytes;
+    FILE *fp;
+    struct stat st;
+
+    if (!(fp = fopen(path, "r"))) {
+        return -1;
+    }
+
+    ret = stat(path, &st);
+    if (ret == -1) {
+        flb_errno();
+        fclose(fp);
+        return -1;
+    }
+
+    buf = flb_calloc(1, (st.st_size + 1));
+    if (!buf) {
+        flb_errno();
+        fclose(fp);
+        return -1;
+    }
+
+    bytes = fread(buf, st.st_size, 1, fp);
+    if (bytes < 1) {
+        flb_free(buf);
+        fclose(fp);
+        return -1;
+    }
+
+    fclose(fp);
+
+    /* trim new lines */
+    for (len = st.st_size; len > 0; len--) {
+        if (buf[len-1] != '\n' && buf[len-1] != '\r') {
+            break;
+        }
+    }
+    buf[len] = '\0';
+
+    *out_buf = buf;
+    *out_size = len;
+
+    return 0;
+}
+
+/* Set Authorization Token and get HTTP Auth Header */
+static int set_http_auth_header(struct opentelemetry_context *ctx)
+{
+    int ret;
+    char *temp;
+    char *tk = NULL;
+    size_t tk_size = 0;
+
+    if (!ctx->token_file || strlen(ctx->token_file) == 0) {
+        return 0;
+    }
+
+    ret = file_to_buffer(ctx->token_file, &tk, &tk_size);
+    if (ret == -1) {
+        flb_plg_warn(ctx->ins, "cannot open %s", ctx->token_file);
+        return -1;
+    }
+    ctx->token_read = time(NULL);
+
+    /* Token */
+    if (ctx->token != NULL) {
+        flb_free(ctx->token);
+    }
+    ctx->token = tk;
+    ctx->token_len = tk_size;
+
+    /* HTTP Auth Header */
+    if (ctx->auth == NULL) {
+        ctx->auth = flb_malloc(tk_size + 32);
+    }
+    else if (ctx->auth_len < tk_size + 32) {
+        temp = flb_realloc(ctx->auth, tk_size + 32);
+        if (temp == NULL) {
+            flb_errno();
+            flb_free(ctx->auth);
+            ctx->auth = NULL;
+            return -1;
+        }
+        ctx->auth = temp;
+    }
+
+    if (!ctx->auth) {
+        return -1;
+    }
+
+    ctx->auth_len = snprintf(ctx->auth, tk_size + 32, "Bearer %s", tk);
+    return 0;
+}
+
+/* Refresh HTTP Auth Header if K8s Authorization Token is expired */
+static int refresh_token_if_needed(struct opentelemetry_context *ctx)
+{
+    int expired = FLB_FALSE;
+    int ret;
+
+    if (!ctx->token_file || strlen(ctx->token_file) == 0) {
+        return 0;
+    }
+
+    if (ctx->token_read > 0) {
+        if (time(NULL) > ctx->token_read + ctx->token_ttl) {
+            expired = FLB_TRUE;
+        }
+    }
+
+    if (expired || ctx->token_read == 0) {
+        ret = set_http_auth_header(ctx);
+        if (ret == -1) {
+            return -1;
+        }
+    }
+
+    return 0;
+}
 
 int opentelemetry_legacy_post(struct opentelemetry_context *ctx,
                               const void *body, size_t body_len,
@@ -72,6 +205,12 @@ int opentelemetry_legacy_post(struct opentelemetry_context *ctx,
                       ctx->u->tcp_host,
                       ctx->u->tcp_port);
 
+        return FLB_RETRY;
+    }
+
+    ret = refresh_token_if_needed(ctx);
+    if (ret == -1) {
+        flb_plg_error(ctx->ins, "failed to refresh token");
         return FLB_RETRY;
     }
 
@@ -133,6 +272,10 @@ int opentelemetry_legacy_post(struct opentelemetry_context *ctx,
     if (ctx->http_user != NULL &&
         ctx->http_passwd != NULL) {
         flb_http_basic_auth(c, ctx->http_user, ctx->http_passwd);
+    }
+
+    if (ctx->auth_len > 0) {
+        flb_http_add_header(c, "Authorization", 13, ctx->auth, ctx->auth_len);
     }
 
     flb_http_add_header(c, "User-Agent", 10, "Fluent-Bit", 10);
@@ -643,6 +786,88 @@ exit:
     return result;
 }
 
+static int process_profiles(struct flb_event_chunk *event_chunk,
+                            struct flb_output_flush *out_flush,
+                            struct flb_input_instance *ins, void *out_context,
+                            struct flb_config *config)
+{
+    int ret;
+    int result;
+    cfl_sds_t encoded_chunk;
+    flb_sds_t buf = NULL;
+    size_t off = 0;
+    struct cprof *profiles_context;
+    struct opentelemetry_context *ctx = out_context;
+
+    /* Initialize vars */
+    ctx = out_context;
+    result = FLB_OK;
+
+    buf = flb_sds_create_size(event_chunk->size);
+    if (!buf) {
+        flb_plg_error(ctx->ins, "could not allocate outgoing buffer");
+        return FLB_RETRY;
+    }
+
+    flb_plg_debug(ctx->ins, "cprofiles msgpack size: %lu",
+                  event_chunk->size);
+
+    while (cprof_decode_msgpack_create(&profiles_context,
+                                       (unsigned char *) event_chunk->data,
+                                       event_chunk->size, &off) == 0) {
+        /* Create a OpenTelemetry payload */
+        ret = cprof_encode_opentelemetry_create(&encoded_chunk, profiles_context);
+        if (ret != CPROF_ENCODE_OPENTELEMETRY_SUCCESS) {
+            flb_plg_error(ctx->ins,
+                          "Error encoding context as opentelemetry");
+            result = FLB_ERROR;
+            cprof_decode_msgpack_destroy(profiles_context);
+            goto exit;
+        }
+
+        /* concat buffer */
+        ret = flb_sds_cat_safe(&buf, encoded_chunk, flb_sds_len(encoded_chunk));
+        if (ret != 0) {
+            flb_plg_error(ctx->ins, "Error appending encoded profiles to buffer");
+            result = FLB_ERROR;
+            cprof_encode_opentelemetry_destroy(encoded_chunk);
+            cprof_decode_msgpack_destroy(profiles_context);
+            goto exit;
+        }
+
+        /* release */
+        cprof_encode_opentelemetry_destroy(encoded_chunk);
+        cprof_decode_msgpack_destroy(profiles_context);
+    }
+
+    flb_plg_debug(ctx->ins, "final payload size: %lu", flb_sds_len(buf));
+    if (buf && flb_sds_len(buf) > 0) {
+        /* Send HTTP request */
+        result = opentelemetry_post(ctx, buf, flb_sds_len(buf),
+                                    event_chunk->tag,
+                                    flb_sds_len(event_chunk->tag),
+                                    ctx->profiles_uri_sanitized,
+                                    ctx->grpc_profiles_uri);
+
+        /* Debug http_post() result statuses */
+        if (result == FLB_OK) {
+            flb_plg_debug(ctx->ins, "http_post result FLB_OK");
+        }
+        else if (result == FLB_ERROR) {
+            flb_plg_debug(ctx->ins, "http_post result FLB_ERROR");
+        }
+        else if (result == FLB_RETRY) {
+            flb_plg_debug(ctx->ins, "http_post result FLB_RETRY");
+        }
+    }
+
+exit:
+    if (buf) {
+        flb_sds_destroy(buf);
+    }
+    return result;
+}
+
 static int cb_opentelemetry_exit(void *data, struct flb_config *config)
 {
     struct opentelemetry_context *ctx;
@@ -689,6 +914,9 @@ static void cb_opentelemetry_flush(struct flb_event_chunk *event_chunk,
     }
     else if (event_chunk->type == FLB_INPUT_TRACES){
         result = process_traces(event_chunk, out_flush, ins, out_context, config);
+    }
+    else if (event_chunk->type == FLB_INPUT_PROFILES){
+        result = process_profiles(event_chunk, out_flush, ins, out_context, config);
     }
 
     FLB_OUTPUT_RETURN(result);
@@ -788,9 +1016,22 @@ static struct flb_config_map config_map[] = {
      "Specify an optional HTTP URI for the target OTel endpoint."
     },
     {
-     FLB_CONFIG_MAP_STR, "grpc_traces_uri", "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
+     FLB_CONFIG_MAP_STR, "grpc_traces_uri",
+     "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
      0, FLB_TRUE, offsetof(struct opentelemetry_context, grpc_traces_uri),
      "Specify an optional gRPC URI for the target OTel endpoint."
+    },
+
+    {
+     FLB_CONFIG_MAP_STR, "profiles_uri", "/v1development/profiles",
+     0, FLB_TRUE, offsetof(struct opentelemetry_context, profiles_uri),
+     "Specify an optional HTTP URI for the profiles OTel endpoint."
+    },
+    {
+     FLB_CONFIG_MAP_STR, "grpc_profiles_uri",
+     "/opentelemetry.proto.collector.profiles.v1experimental.ProfilesService/Export",
+     0, FLB_TRUE, offsetof(struct opentelemetry_context, grpc_profiles_uri),
+     "Specify an optional gRPC URI for the profiles OTel endpoint."
     },
 
     {
@@ -872,7 +1113,18 @@ static struct flb_config_map config_map[] = {
      0, FLB_TRUE, offsetof(struct opentelemetry_context, logs_severity_number_message_key),
      "Specify a Severity Number key"
     },
-
+    /* Kubernetes Token file */
+    {
+     FLB_CONFIG_MAP_STR, "kube_token_file", NULL,
+     0, FLB_TRUE, offsetof(struct opentelemetry_context, token_file),
+     "Kubernetes authorization token file"
+    },
+    /* Kubernetes Token file TTL */
+    {
+     FLB_CONFIG_MAP_TIME, "kube_token_ttl", "10m",
+     0, FLB_TRUE, offsetof(struct opentelemetry_context, token_ttl),
+     "kubernetes token ttl, until it is reread from the token file. Default: 10m"
+    },
 
     /* EOF */
     {0}
@@ -886,7 +1138,7 @@ struct flb_output_plugin out_opentelemetry_plugin = {
     .cb_flush    = cb_opentelemetry_flush,
     .cb_exit     = cb_opentelemetry_exit,
     .config_map  = config_map,
-    .event_type  = FLB_OUTPUT_LOGS | FLB_OUTPUT_METRICS | FLB_OUTPUT_TRACES,
+    .event_type  = FLB_OUTPUT_LOGS | FLB_OUTPUT_METRICS | FLB_OUTPUT_TRACES | FLB_OUTPUT_PROFILES,
     .flags       = FLB_OUTPUT_NET | FLB_IO_OPT_TLS,
 
     .test_formatter.callback = opentelemetry_format_test,
